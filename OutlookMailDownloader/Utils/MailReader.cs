@@ -8,6 +8,7 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Xml.Linq;
 using Azure.Identity;
+using OutlookMailDownloader.Models;
 
 namespace OutlookMailDownloader.Utils
 {
@@ -22,6 +23,8 @@ namespace OutlookMailDownloader.Utils
 
         public async Task ReceiveAsync(
             string authFile,
+            Func<string, string, DateTimeOffset?, byte[], Task> saveAttachment,
+            Func<string, Task<bool>> needDownload,
             CancellationToken cancellationToken
         )
         {
@@ -51,7 +54,8 @@ namespace OutlookMailDownloader.Utils
             };
 
             // https://docs.microsoft.com/dotnet/api/azure.identity.interactivebrowsercredential
-            InteractiveBrowserCredential credential;
+            TokenCredential credential;
+            InteractiveBrowserCredential browserCredential;
             AuthenticationRecord authRecord;
 
             // https://docs.microsoft.com/en-us/dotnet/api/azure.identity.tokencachepersistenceoptions?view=azure-dotnet
@@ -62,10 +66,10 @@ namespace OutlookMailDownloader.Utils
             {
                 // Construct a credential with TokenCachePersistenceOptions specified to ensure that the token cache is persisted to disk.
                 // We can also optionally specify a name for the cache to avoid having it cleared by other applications.
-                credential = new InteractiveBrowserCredential(options);
+                browserCredential = new InteractiveBrowserCredential(options);
 
                 // Call AuthenticateAsync to fetch a new AuthenticationRecord.
-                authRecord = await credential.AuthenticateAsync(
+                authRecord = await browserCredential.AuthenticateAsync(
                     new TokenRequestContext(scopes, null, null, tenantId),
                     cancellationToken
                 );
@@ -75,6 +79,8 @@ namespace OutlookMailDownloader.Utils
                 {
                     await authRecord.SerializeAsync(authRecordStream);
                 }
+
+                credential = browserCredential;
             }
             else
             {
@@ -86,20 +92,25 @@ namespace OutlookMailDownloader.Utils
                     // Construct a new client with our TokenCachePersistenceOptions with the addition of the AuthenticationRecord property.
                     // This tells the credential to use the same token cache in addition to which account to try and fetch from cache when GetToken is called.
                     options.AuthenticationRecord = authRecord;
-                    credential = new InteractiveBrowserCredential(options);
+                    browserCredential = new InteractiveBrowserCredential(options);
 
-                    await credential.AuthenticateAsync(
-                        new TokenRequestContext(scopes, null, null, tenantId),
-                        cancellationToken
-                    );
+                    //await credential.AuthenticateAsync(
+                    //    new TokenRequestContext(scopes, null, null, tenantId),
+                    //    cancellationToken
+                    //);
+
+                    credential = browserCredential;
                 }
             }
+
+            //Console.WriteLine(credential.GetToken(new TokenRequestContext(scopes)).Token);
 
             var graphClient = new GraphServiceClient(credential, scopes);
 
             var msgs = await graphClient.Me
                 .Messages
                 .Request()
+                .Expand("attachments")
                 .GetAsync();
 
             while (true)
@@ -108,13 +119,50 @@ namespace OutlookMailDownloader.Utils
                 {
                     foreach (var msg in msgs.CurrentPage)
                     {
-                        Console.WriteLine($"{msg.LastModifiedDateTime} {msg.Subject} ({msg.Attachments?.CurrentPage?.Count})");
+                        if (!(await needDownload(msg.Id)))
+                        {
+                            return;
+                        }
+
+                        Console.WriteLine($"{msg.LastModifiedDateTime} {msg.Subject} ({msg.Attachments?.Count})");
+
+                        if (msg.HasAttachments == true)
+                        {
+                            var attachments = msg.Attachments;
+
+                            while (true)
+                            {
+                                if (attachments?.CurrentPage != null)
+                                {
+                                    foreach (var attachment in attachments.CurrentPage.OfType<FileAttachment>())
+                                    {
+                                        Console.WriteLine($"- {attachment.Name} {attachment.ContentBytes?.Length}");
+                                        if (attachment.ContentBytes != null)
+                                        {
+                                            await saveAttachment(
+                                                msg.Subject,
+                                                attachment.Name,
+                                                attachment.LastModifiedDateTime,
+                                                attachment.ContentBytes
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if (attachments?.NextPageRequest == null)
+                                {
+                                    break;
+                                }
+
+                                attachments = await attachments.NextPageRequest.GetAsync();
+                            }
+                        }
                     }
                 }
 
                 if (msgs.NextPageRequest == null)
                 {
-                    break;
+                    return;
                 }
 
                 msgs = await msgs.NextPageRequest.GetAsync();

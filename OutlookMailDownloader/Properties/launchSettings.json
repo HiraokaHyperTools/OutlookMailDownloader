@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "OutlookMailDownloader": {
+      "commandName": "Project",
+      "commandLineArgs": "run z"
+    }
+  }
+}
